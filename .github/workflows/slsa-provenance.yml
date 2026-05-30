@@ -31,7 +31,7 @@ permissions:
 
 env:
   AWS_REGION: us-east-1
-  PROVENANCE_ROLE: arn:aws:iam::829808296602:role/trusted-ci-provenance
+  AWS_ACCOUNT: "829808296602"
   # buildType identifies the predicate schema/convention; builder.id below is the isolated signer.
   BUILD_TYPE: https://github.com/asanexample/platform/build-types/github-actions-docker@v1
 
@@ -43,7 +43,13 @@ jobs:
       # image outside the CALLING team's namespace. Caller repos are named app-<team>; the image
       # path must be team-<team>/*. (Primary isolation is still the per-team cosign signature +
       # Kyverno's per-team caller-extension check; this just shrinks blast radius.)
-      - name: Guard — image namespace matches caller team
+      # Derive the caller's team and resolve the per-team push role. We assume the team's existing
+      # github-actions-ecr-push-<team> role (scoped to team-<team>/* in ECR), NOT a shared signer
+      # role: AWS only honours the OIDC `sub`/`aud` claims in trust conditions (not job_workflow_ref),
+      # and that role's trust already matches the caller's `sub`. Per-team scope is the tightest fit.
+      # The L3 isolation does NOT come from this role — it comes from the cosign cert identity below.
+      - name: Guard + resolve team push role
+        id: team
         env:
           IMAGE: ${{ inputs.image }}
           CALLER: ${{ github.repository }}
@@ -58,19 +64,12 @@ jobs:
             */team-"$team"/*) echo "ok: image is in team-$team namespace" ;;
             *) echo "::error::image '$IMAGE' is not in the caller's team-$team namespace"; exit 1 ;;
           esac
+          echo "role_arn=arn:aws:iam::${AWS_ACCOUNT}:role/github-actions-ecr-push-${team}" >> "$GITHUB_OUTPUT"
 
-      - name: DEBUG — decode OIDC claims (temporary)
-        run: |
-          tok=$(curl -sH "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" \
-            | python3 -c "import sys,json;print(json.load(sys.stdin)['value'])")
-          p=$(echo "$tok" | cut -d. -f2); p="${p}$(printf '%*s' $(((4-${#p}%4)%4)) '' | tr ' ' '=')"
-          echo "$p" | base64 -d 2>/dev/null | python3 -c "import sys,json;c=json.load(sys.stdin);print('CLAIMS',{k:c.get(k) for k in ['aud','sub','repository','job_workflow_ref','ref','workflow_ref']})"
-
-      - name: Configure AWS credentials (assume isolated signer role)
+      - name: Configure AWS credentials (caller team's ECR role)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ env.PROVENANCE_ROLE }}
+          role-to-assume: ${{ steps.team.outputs.role_arn }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Log in to Amazon ECR
