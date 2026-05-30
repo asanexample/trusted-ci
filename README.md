@@ -56,7 +56,10 @@ cosign verify-attestation --type slsaprovenance \
   containment line.
 - **`team`/`image` guard:** the workflow refuses to attest an image outside the calling
   `app-<team>` repo's `team-<team>/*` namespace.
-- **AWS role `trusted-ci-provenance`** is scoped by the OIDC `job_workflow_ref` claim — it can
-  be assumed *only while this workflow runs* (defined in the platform `github-oidc` unit).
+- **AWS role:** the signer assumes the **caller team's existing `github-actions-ecr-push-<team>`
+  role** (derived from the caller repo), whose ECR scope is already limited to `team-<team>/*`.
+  We do *not* use a shared `job_workflow_ref`-scoped role: AWS only honors the OIDC `sub`/`aud`
+  claims in IAM trust conditions, not `job_workflow_ref`. The AWS role is only ECR-push transport —
+  the non-forgeability guarantee is the cosign certificate identity, not the role.
 - **Recommended follow-up:** SHA-pin the third-party actions below (Dependabot keeps them
   current); branch protection + this `CODEOWNERS` keep changes reviewed by the platform team.
