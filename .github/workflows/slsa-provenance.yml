@@ -1,0 +1,122 @@
+name: SLSA provenance (isolated signer)
+
+# Reusable workflow that attaches a SLSA build-provenance attestation to an already-built
+# container image, signed keyless with THIS workflow's own GitHub OIDC identity (Fulcio/Rekor).
+#
+# Why this exists (SLSA Build L3, platform #131 / ADR-042): when an app's own build job both
+# writes AND signs its provenance, a compromised build step could forge it. This workflow lives
+# in a repo app teams cannot write to, so the calling build cannot influence it — the Fulcio
+# cert's signer identity (SAN) is THIS workflow, not the caller. Kyverno admits only provenance
+# signed by this identity (and, per team, only when the cert's github-workflow-repository
+# extension is the team's own app repo).
+#
+# It mints its own ECR token (assume-role + ecr-login), so no registry credential ever crosses
+# a job boundary — the off-the-shelf slsa-github-generator could not do this with ECR (#131 P0).
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: "ECR image reference WITHOUT tag/digest, e.g. <acct>.dkr.ecr.<region>.amazonaws.com/team-<team>/<app>"
+        required: true
+        type: string
+      digest:
+        description: "Image digest of the form sha256:<hex>"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write # OIDC for BOTH the AWS assume-role and Sigstore keyless signing
+
+env:
+  AWS_REGION: us-east-1
+  PROVENANCE_ROLE: arn:aws:iam::829808296602:role/trusted-ci-provenance
+  # buildType identifies the predicate schema/convention; builder.id below is the isolated signer.
+  BUILD_TYPE: https://github.com/asanexample/platform/build-types/github-actions-docker@v1
+
+jobs:
+  provenance:
+    runs-on: ubuntu-latest
+    steps:
+      # Defense-in-depth: this shared signer can push to any team repo, so refuse to attest an
+      # image outside the CALLING team's namespace. Caller repos are named app-<team>; the image
+      # path must be team-<team>/*. (Primary isolation is still the per-team cosign signature +
+      # Kyverno's per-team caller-extension check; this just shrinks blast radius.)
+      - name: Guard — image namespace matches caller team
+        env:
+          IMAGE: ${{ inputs.image }}
+          CALLER: ${{ github.repository }}
+        run: |
+          repo_name="${CALLER##*/}"     # asanexample/app-alpha -> app-alpha
+          team="${repo_name#app-}"      # app-alpha -> alpha
+          if [ "$team" = "$repo_name" ]; then
+            echo "::error::caller '$CALLER' is not an app-<team> repo; refusing to sign"
+            exit 1
+          fi
+          case "$IMAGE" in
+            */team-"$team"/*) echo "ok: image is in team-$team namespace" ;;
+            *) echo "::error::image '$IMAGE' is not in the caller's team-$team namespace"; exit 1 ;;
+          esac
+
+      - name: Configure AWS credentials (assume isolated signer role)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.PROVENANCE_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+        with:
+          # Pin cosign v2: legacy `.att` DSSE attestation, which Kyverno's default attestor
+          # verifies (cosign v3's bundle/referrers format needs Kyverno's opt-in SigstoreBundle).
+          cosign-release: "v2.5.2"
+
+      # SLSA v0.2 provenance. builder.id = THIS isolated workflow (the cert SAN proves it); the
+      # invocation/materials record the CALLING app repo+commit as the source that was built.
+      - name: Generate + attest SLSA provenance (cosign keyless)
+        env:
+          IMAGE: ${{ inputs.image }}
+          DIGEST: ${{ inputs.digest }}
+          SERVER_URL: ${{ github.server_url }}
+          CALLER_REPO: ${{ github.repository }}
+          CALLER_REF: ${{ github.ref }}
+          CALLER_SHA: ${{ github.sha }}
+          CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          ref_image="${IMAGE}@${DIGEST}"
+
+          # entryPoint = the caller's workflow path (strip the org/repo prefix and @ref suffix)
+          entry="${CALLER_WORKFLOW_REF#*/*/}"; entry="${entry%@*}"
+
+          cat > provenance.json <<JSON
+          {
+            "builder": { "id": "${SERVER_URL}/asanexample/trusted-ci/.github/workflows/slsa-provenance.yml" },
+            "buildType": "${BUILD_TYPE}",
+            "invocation": {
+              "configSource": {
+                "uri": "git+${SERVER_URL}/${CALLER_REPO}@${CALLER_REF}",
+                "digest": { "sha1": "${CALLER_SHA}" },
+                "entryPoint": "${entry}"
+              },
+              "environment": { "github_run_id": "${RUN_ID}", "github_run_attempt": "${RUN_ATTEMPT}" }
+            },
+            "metadata": {
+              "buildInvocationId": "${RUN_ID}-${RUN_ATTEMPT}",
+              "completeness": { "parameters": true, "environment": false, "materials": false },
+              "reproducible": false
+            },
+            "materials": [
+              { "uri": "git+${SERVER_URL}/${CALLER_REPO}@${CALLER_REF}", "digest": { "sha1": "${CALLER_SHA}" } }
+            ]
+          }
+          JSON
+
+          echo "Attesting ${ref_image} (source ${CALLER_REPO}@${CALLER_SHA})"
+          cosign attest --yes --type slsaprovenance --predicate provenance.json "${ref_image}"

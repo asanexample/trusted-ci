@@ -1,0 +1,8 @@
+version: 2
+updates:
+  # Keep the third-party actions in the trusted signer current. Review major bumps carefully —
+  # this repo is a supply-chain trust root.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly

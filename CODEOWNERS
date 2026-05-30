@@ -1,0 +1,3 @@
+# The platform team owns every trusted workflow here. This is part of the isolation property:
+# changes to the signing workflows must be reviewed by the platform team, never an app team.
+* @asanexample/platform
