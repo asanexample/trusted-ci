@@ -67,7 +67,7 @@ jobs:
           echo "role_arn=arn:aws:iam::${AWS_ACCOUNT}:role/github-actions-ecr-push-${team}" >> "$GITHUB_OUTPUT"
 
       - name: Configure AWS credentials (caller team's ECR role)
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ steps.team.outputs.role_arn }}
           aws-region: ${{ env.AWS_REGION }}
