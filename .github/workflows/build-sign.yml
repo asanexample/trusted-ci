@@ -76,7 +76,7 @@ jobs:
       image: ${{ steps.meta.outputs.image }}
       digest: ${{ steps.build.outputs.digest }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       # Validate inputs (these flow into run: steps below — an unsanitized value would be shell injection in
       # a workflow app teams cannot otherwise influence) and derive the caller's team from its app-<team> repo
