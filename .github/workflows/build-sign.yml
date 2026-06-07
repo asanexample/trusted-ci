@@ -45,10 +45,12 @@ on:
         type: string
         default: ""
       platforms:
-        description: "Optional comma-separated build platforms (e.g. linux/amd64)."
+        description: "Comma-separated build platforms. Defaults to multi-arch (amd64+arm64) so images run on
+          Graviton/t4g nodes. QEMU is set up below for emulated arch; Go/compiled apps should cross-compile in
+          their Dockerfile (FROM --platform=$BUILDPLATFORM + $TARGETARCH) to build natively (no emulation)."
         required: false
         type: string
-        default: ""
+        default: "linux/amd64,linux/arm64"
       ecr-registry:
         description: "ECR registry host. Defaults to the platform account ECR."
         required: false
@@ -111,6 +113,11 @@ jobs:
 
       - name: Log in to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
+
+      # Enables building non-native architectures (e.g. arm64 on an amd64 runner). Apps that cross-compile in
+      # their Dockerfile won't hit emulation; this is the fallback for those that build natively per-arch.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
