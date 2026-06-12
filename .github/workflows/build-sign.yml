@@ -107,11 +107,16 @@ jobs:
           case "$PRODUCT" in
             "" | *[!a-z0-9-]*) echo "::error::invalid product name '$PRODUCT' (must match ^[a-z0-9-]+$)"; exit 1 ;;
           esac
-          repo_name="${CALLER##*/}"   # asanexample/app-bravo -> app-bravo
-          team="${repo_name#app-}"    # app-bravo -> bravo
-          if [ "$team" = "$repo_name" ]; then
-            echo "::error::caller '$CALLER' is not an app-<team> repo; refusing to build"; exit 1
-          fi
+          # Repo must be app-<team>[-<product>] (the v3 repo-per-product convention). `team` is the FIRST
+          # segment after the app- prefix (app-alpha -> alpha; app-alpha-shop -> alpha) — unspoofable because
+          # repo creation is platform-controlled (the New Product template), and the app- prefix is required.
+          repo_name="${CALLER##*/}"   # asanexample/app-alpha-shop -> app-alpha-shop
+          case "$repo_name" in
+            app-*) : ;;
+            *) echo "::error::caller '$CALLER' is not an app-<team>[-<product>] repo; refusing to build"; exit 1 ;;
+          esac
+          rest="${repo_name#app-}"    # app-alpha-shop -> alpha-shop
+          team="${rest%%-*}"          # alpha-shop -> alpha (first segment)
           echo "role_arn=arn:aws:iam::${AWS_ACCOUNT}:role/github-actions-ecr-push-product-${team}-${PRODUCT}" >> "$GITHUB_OUTPUT"
           echo "image=${REGISTRY}/team-${team}/${APP}" >> "$GITHUB_OUTPUT"
 
