@@ -20,6 +20,10 @@ on:
         description: "App name; the image is pushed to team-<team>/<app> (team derived from the app-<team> repo name)."
         required: true
         type: string
+      product:
+        description: "Product short name (ADR-069). Selects the per-Product OIDC role github-actions-ecr-push-product-<team>-<product>, which trusts only the Product's repo and is scoped to team-<team>/<product>-* in ECR. The caller derives it from its Product registry entry; spoofing it just selects a role whose trust policy won't match the caller."
+        required: true
+        type: string
       tag:
         description: "Image tag to push (e.g. the commit SHA or PR head SHA)."
         required: true
@@ -82,14 +86,17 @@ jobs:
 
       # Validate inputs (these flow into run: steps below — an unsanitized value would be shell injection in
       # a workflow app teams cannot otherwise influence) and derive the caller's team from its app-<team> repo
-      # name (NOT a caller input — cannot be spoofed). Resolve the per-team ECR push role + image repo. We
-      # assume the team's existing github-actions-ecr-push-<team> role (scoped to team-<team>/* in ECR); AWS
-      # honours only the OIDC sub/aud in trust conditions, and that role's trust already matches the caller's
-      # sub. Mirrors slsa-provenance.yml's guard.
+      # name (NOT a caller input — cannot be spoofed). Resolve the per-PRODUCT ECR push role + image repo (ADR-069
+      # §5): we assume github-actions-ecr-push-product-<team>-<product>, which trusts ONLY the Product's repo and is
+      # scoped to team-<team>/<product>-* in ECR. `team` is derived (unspoofable); `product` is a caller input but
+      # is not a trust boundary — AWS honours only the OIDC sub/aud in the role's trust conditions, so a wrong
+      # product just names a role whose trust won't match the caller's sub (assume-role fails). Mirrors
+      # slsa-provenance.yml's guard.
       - name: Resolve team + image
         id: meta
         env:
           APP: ${{ inputs.app }}
+          PRODUCT: ${{ inputs.product }}
           REGISTRY: ${{ inputs.ecr-registry }}
           CALLER: ${{ github.repository }}
         run: |
@@ -97,12 +104,15 @@ jobs:
           case "$APP" in
             "" | *[!a-z0-9-]*) echo "::error::invalid app name '$APP' (must match ^[a-z0-9-]+$)"; exit 1 ;;
           esac
+          case "$PRODUCT" in
+            "" | *[!a-z0-9-]*) echo "::error::invalid product name '$PRODUCT' (must match ^[a-z0-9-]+$)"; exit 1 ;;
+          esac
           repo_name="${CALLER##*/}"   # asanexample/app-bravo -> app-bravo
           team="${repo_name#app-}"    # app-bravo -> bravo
           if [ "$team" = "$repo_name" ]; then
             echo "::error::caller '$CALLER' is not an app-<team> repo; refusing to build"; exit 1
           fi
-          echo "role_arn=arn:aws:iam::${AWS_ACCOUNT}:role/github-actions-ecr-push-${team}" >> "$GITHUB_OUTPUT"
+          echo "role_arn=arn:aws:iam::${AWS_ACCOUNT}:role/github-actions-ecr-push-product-${team}-${PRODUCT}" >> "$GITHUB_OUTPUT"
           echo "image=${REGISTRY}/team-${team}/${APP}" >> "$GITHUB_OUTPUT"
 
       - name: Configure AWS credentials (caller team's ECR role)
