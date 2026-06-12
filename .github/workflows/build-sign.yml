@@ -116,7 +116,7 @@ jobs:
           echo "image=${REGISTRY}/team-${team}/${APP}" >> "$GITHUB_OUTPUT"
 
       - name: Configure AWS credentials (caller team's ECR role)
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ steps.meta.outputs.role_arn }}
           aws-region: ${{ env.AWS_REGION }}
