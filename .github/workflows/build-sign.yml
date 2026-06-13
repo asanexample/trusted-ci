@@ -132,7 +132,7 @@ jobs:
       # Enables building non-native architectures (e.g. arm64 on an amd64 runner). Apps that cross-compile in
       # their Dockerfile won't hit emulation; this is the fallback for those that build natively per-arch.
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
