@@ -109,18 +109,23 @@ jobs:
           set -euo pipefail
           secret="$(aws secretsmanager get-secret-value --secret-id "$PROMOTE_SECRET" \
             --query SecretString --output text)"
-          app_id="$(jq -r '.app_id' <<<"$secret")"
-          echo "app_id=${app_id}" >> "$GITHUB_OUTPUT"
-          # Stash the PEM in a file (avoids it crossing step outputs / logs).
-          jq -r '.private_key' <<<"$secret" > "${RUNNER_TEMP}/promote.pem"
-          echo "key_path=${RUNNER_TEMP}/promote.pem" >> "$GITHUB_OUTPUT"
+          echo "app_id=$(jq -r '.app_id' <<<"$secret")" >> "$GITHUB_OUTPUT"
+          # create-github-app-token wants the PEM CONTENT (not a path). Mask it, then pass via a multiline
+          # output — it never lands in the logs and is gone when the job ends.
+          pem="$(jq -r '.private_key' <<<"$secret")"
+          echo "::add-mask::${pem}"
+          {
+            echo "pem<<PROMOTE_PEM_EOF"
+            printf '%s\n' "$pem"
+            echo "PROMOTE_PEM_EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Mint promote App token (scoped to the platform repo)
         id: token
         uses: actions/create-github-app-token@v1
         with:
           app-id: ${{ steps.appcred.outputs.app_id }}
-          private-key: ${{ steps.appcred.outputs.key_path }}
+          private-key: ${{ steps.appcred.outputs.pem }}
           owner: ${{ github.repository_owner }}
           repositories: platform
 
