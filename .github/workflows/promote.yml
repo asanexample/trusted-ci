@@ -1,0 +1,169 @@
+name: Promote (shared)
+
+# Reusable workflow (ADR-071 — control-plane digest promotion). After an app's image is built + cosign-signed +
+# pushed (build-sign.yml), the app's deploy.yml calls THIS workflow to record the deployed digest in the PLATFORM
+# control-plane repo instead of pushing a pin to its own main. It opens a gated PR bumping
+# gitops/releases/<team>/<product>/<stage>[-<customer>].yaml as the least-privilege `asanexample-promote` GitHub
+# App; the gitops Gate validates + auto-merges it, and the per-Product ApplicationSet injects the digest. The app
+# repo's main is therefore NEVER written by CI and stays fully protected.
+#
+# Trust model (mirrors build-sign.yml): `team` is derived from the caller's app-<team>[-<product>] repo name
+# (unspoofable); we assume the per-Product OIDC role github-actions-ecr-push-product-<team>-<product> (the same
+# role build-sign uses), read the promote App key from Secrets Manager (platform/promote/github-app), and mint a
+# short-lived installation token. This workflow lives in a repo app teams cannot write to, so a compromised app
+# build cannot alter the promotion steps. docs/runbooks/promote-github-app.md.
+
+on:
+  workflow_call:
+    inputs:
+      product:
+        description: "Product short name (ADR-069). Selects the per-Product OIDC role + the gitops/releases path."
+        required: true
+        type: string
+      service:
+        description: "Service name within the Product (the image is team-<team>/<product>-<service>)."
+        required: true
+        type: string
+      stage:
+        description: "Stage to promote into (dev/test/uat/staging/prod). Must be an existing Environment."
+        required: true
+        type: string
+      digest:
+        description: "The cosign-signed image MANIFEST digest to deploy (sha256:<64 hex>) — from build-sign's output."
+        required: true
+        type: string
+      customer:
+        description: "Optional Customer (per-customer Environments). Empty for pooled."
+        required: false
+        type: string
+        default: ""
+      platform-repo:
+        description: "The control-plane repo to open the release PR against."
+        required: false
+        type: string
+        default: "asanexample/platform"
+
+env:
+  AWS_REGION: us-east-1
+  AWS_ACCOUNT: "829808296602"
+  PROMOTE_SECRET: platform/promote/github-app
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # OIDC → the per-Product role (to read the promote App key). No contents write needed here.
+      contents: read
+    steps:
+      # Validate inputs (they flow into run: steps — sanitize in a workflow app teams cannot influence) and
+      # derive team from the caller's app-<team>[-<product>] repo name (NOT an input — unspoofable). Compute the
+      # Environment name + the gitops/releases path the same way the scaffolder/Composition do:
+      #   pooled:        name <team>-<product>-<stage>            file <stage>.yaml
+      #   per-customer:  name <team>-<product>-<customer>-<stage> file <customer>-<stage>.yaml
+      - name: Resolve target
+        id: meta
+        env:
+          PRODUCT: ${{ inputs.product }}
+          SERVICE: ${{ inputs.service }}
+          STAGE: ${{ inputs.stage }}
+          DIGEST: ${{ inputs.digest }}
+          CUSTOMER: ${{ inputs.customer }}
+          CALLER: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          for v in PRODUCT SERVICE STAGE; do
+            val="${!v}"
+            case "$val" in "" | *[!a-z0-9-]*) echo "::error::invalid ${v} '$val' (must match ^[a-z0-9-]+$)"; exit 1 ;; esac
+          done
+          case "$CUSTOMER" in *[!a-z0-9-]*) echo "::error::invalid customer '$CUSTOMER'"; exit 1 ;; esac
+          case "$DIGEST" in
+            sha256:[0-9a-f]*) [ "${#DIGEST}" -eq 71 ] || { echo "::error::digest must be sha256:<64 hex>"; exit 1; } ;;
+            *) echo "::error::digest '$DIGEST' must be a sha256:<64 hex> manifest digest"; exit 1 ;;
+          esac
+          repo_name="${CALLER##*/}"                    # asanexample/app-alpha-shop -> app-alpha-shop
+          case "$repo_name" in app-*) : ;; *) echo "::error::caller '$CALLER' is not an app-<team>[-<product>] repo"; exit 1 ;; esac
+          team="${repo_name#app-}"; team="${team%%-*}"  # app-alpha-shop -> alpha
+          if [ -n "$CUSTOMER" ]; then
+            env_name="${team}-${PRODUCT}-${CUSTOMER}-${STAGE}"; stem="${CUSTOMER}-${STAGE}"
+          else
+            env_name="${team}-${PRODUCT}-${STAGE}"; stem="${STAGE}"
+          fi
+          {
+            echo "team=${team}"
+            echo "role_arn=arn:aws:iam::${AWS_ACCOUNT}:role/github-actions-ecr-push-product-${team}-${PRODUCT}"
+            echo "env_name=${env_name}"
+            echo "rel_path=gitops/releases/${team}/${PRODUCT}/${stem}.yaml"
+            echo "branch=promote/${env_name}-${SERVICE}-${DIGEST#sha256:}"
+            echo "short=${DIGEST#sha256:}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials (per-Product role)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ steps.meta.outputs.role_arn }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Read the promote App credential
+        id: appcred
+        run: |
+          set -euo pipefail
+          secret="$(aws secretsmanager get-secret-value --secret-id "$PROMOTE_SECRET" \
+            --query SecretString --output text)"
+          app_id="$(jq -r '.app_id' <<<"$secret")"
+          echo "app_id=${app_id}" >> "$GITHUB_OUTPUT"
+          # Stash the PEM in a file (avoids it crossing step outputs / logs).
+          jq -r '.private_key' <<<"$secret" > "${RUNNER_TEMP}/promote.pem"
+          echo "key_path=${RUNNER_TEMP}/promote.pem" >> "$GITHUB_OUTPUT"
+
+      - name: Mint promote App token (scoped to the platform repo)
+        id: token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ steps.appcred.outputs.app_id }}
+          private-key: ${{ steps.appcred.outputs.key_path }}
+          owner: ${{ github.repository_owner }}
+          repositories: platform
+
+      - name: Open the release digest-bump PR
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          PLATFORM_REPO: ${{ inputs.platform-repo }}
+          REL_PATH: ${{ steps.meta.outputs.rel_path }}
+          ENV_NAME: ${{ steps.meta.outputs.env_name }}
+          BRANCH: ${{ steps.meta.outputs.branch }}
+          SERVICE: ${{ inputs.service }}
+          DIGEST: ${{ inputs.digest }}
+          SHORT: ${{ steps.meta.outputs.short }}
+        run: |
+          set -euo pipefail
+          sudo curl -fsSL -o /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+
+          git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/${PLATFORM_REPO}.git" platform
+          cd platform
+          git config user.name  "asanexample-promote[bot]"
+          git config user.email "asanexample-promote[bot]@users.noreply.github.com"
+
+          # Create-or-update via yq (starting from {} if absent), so a multi-service Product accumulates one
+          # digest per Service in a single Release and re-promotes are idempotent — no heredoc indentation traps.
+          mkdir -p "$(dirname "$REL_PATH")"
+          [ -f "$REL_PATH" ] || echo '{}' > "$REL_PATH"
+          ENV_NAME="$ENV_NAME" SERVICE="$SERVICE" DIGEST="$DIGEST" yq -i '
+            .apiVersion = "platform.refplat.org/v1beta1" | .kind = "Release"
+            | .metadata.name = strenv(ENV_NAME)
+            | .spec.environmentRef = strenv(ENV_NAME)
+            | .spec.services[strenv(SERVICE)].digest = strenv(DIGEST)
+          ' "$REL_PATH"
+
+          if git diff --quiet -- "$REL_PATH"; then
+            echo "Digest already pinned for ${SERVICE} in ${ENV_NAME} — nothing to promote."
+            exit 0
+          fi
+
+          git checkout -b "$BRANCH"
+          git add "$REL_PATH"
+          git commit -m "promote: ${ENV_NAME} ${SERVICE} -> sha256:${SHORT}"
+          git push -u origin "$BRANCH"
+          gh pr create --repo "$PLATFORM_REPO" --base main --head "$BRANCH" \
+            --title "promote: ${ENV_NAME} ${SERVICE} -> ${SHORT:0:12}" \
+            --body "Control-plane digest bump (ADR-071): \`${SERVICE}\` in \`${ENV_NAME}\` -> \`${DIGEST}\`. The gitops Gate validates + auto-merges; the ApplicationSet injects it. The app repo's main is untouched."
