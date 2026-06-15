@@ -132,7 +132,7 @@ jobs:
         run: |
           set -uo pipefail
           REPO="${IMAGE#*/}" # strip the registry host → team-<team>/<app> (the ECR repo name)
-          for i in $(seq 1 48); do # ~12 min at 15s; outlasts the reconcile cron (10m) + Composition (~2-3m)
+          for i in $(seq 1 80); do # ~20 min at 15s; the build fires at repo-scaffold time BEFORE the Product PR merges, so this must outlast gate+CI+auto-merge + registry-reconcile + Composition (ECR)
             tok="$(curl -sS "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com" \
               -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" | jq -r '.value')"
             creds="$(aws sts assume-role-with-web-identity --role-arn "$ROLE_ARN" \
@@ -151,7 +151,7 @@ jobs:
             fi
             sleep 15
           done
-          echo "::error::delivery infra (OIDC role + ECR ${REPO}) not ready after ~12 min — check registry-reconcile + the Environment"
+          echo "::error::delivery infra (OIDC role + ECR ${REPO}) not ready after ~20 min — check registry-reconcile + the Environment"
           exit 1
 
       - name: Configure AWS credentials (caller team's ECR role)
