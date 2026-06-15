@@ -160,13 +160,15 @@ jobs:
             | .spec.services[strenv(SERVICE)].digest = strenv(DIGEST)
           ' "$REL_PATH"
 
-          if git diff --quiet -- "$REL_PATH"; then
+          # Stage first, then diff --cached: `git diff` ignores UNTRACKED files, so a brand-new Release (a
+          # product's first deploy) looked like "no change" and was skipped. Staging detects new + modified.
+          git add "$REL_PATH"
+          if git diff --cached --quiet; then
             echo "Digest already pinned for ${SERVICE} in ${ENV_NAME} — nothing to promote."
             exit 0
           fi
 
           git checkout -b "$BRANCH"
-          git add "$REL_PATH"
           git commit -m "promote: ${ENV_NAME} ${SERVICE} -> sha256:${SHORT}"
           git push -u origin "$BRANCH"
           gh pr create --repo "$PLATFORM_REPO" --base main --head "$BRANCH" \
