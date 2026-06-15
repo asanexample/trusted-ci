@@ -120,6 +120,40 @@ jobs:
           echo "role_arn=arn:aws:iam::${AWS_ACCOUNT}:role/github-actions-ecr-push-product-${team}-${PRODUCT}" >> "$GITHUB_OUTPUT"
           echo "image=${REGISTRY}/team-${team}/${APP}" >> "$GITHUB_OUTPUT"
 
+      # ADR-071: a NEW Product's first deploy fires the moment the repo is scaffolded — but its OIDC push-role
+      # (github-oidc / registry-reconcile) and its ECR repo (the Crossplane Composition) provision asynchronously
+      # AFTER the onboarding PR merges. Wait for BOTH before building, so the first deploy is hands-off (no manual
+      # re-run). Bounded; invisible in steady state (both already exist → first poll succeeds). Needs id-token
+      # (already granted) for the OIDC assume-role probe; uses temp creds only to check ECR (no push here).
+      - name: Wait for delivery infra (OIDC role + ECR repo)
+        env:
+          ROLE_ARN: ${{ steps.meta.outputs.role_arn }}
+          IMAGE: ${{ steps.meta.outputs.image }}
+        run: |
+          set -uo pipefail
+          REPO="${IMAGE#*/}" # strip the registry host → team-<team>/<app> (the ECR repo name)
+          for i in $(seq 1 48); do # ~12 min at 15s; outlasts the reconcile cron (10m) + Composition (~2-3m)
+            tok="$(curl -sS "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com" \
+              -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" | jq -r '.value')"
+            creds="$(aws sts assume-role-with-web-identity --role-arn "$ROLE_ARN" \
+              --role-session-name infra-wait --web-identity-token "$tok" --duration-seconds 900 \
+              --query Credentials --output json 2>/dev/null || true)"
+            if [ -n "$creds" ] && [ "$creds" != "null" ]; then
+              if AWS_ACCESS_KEY_ID="$(jq -r .AccessKeyId <<<"$creds")" \
+                 AWS_SECRET_ACCESS_KEY="$(jq -r .SecretAccessKey <<<"$creds")" \
+                 AWS_SESSION_TOKEN="$(jq -r .SessionToken <<<"$creds")" \
+                 aws ecr describe-repositories --region "$AWS_REGION" --repository-names "$REPO" >/dev/null 2>&1; then
+                echo "delivery infra ready: role assumable + ECR ${REPO} exists"; exit 0
+              fi
+              echo "role ready; waiting for ECR ${REPO} (Composition)... (${i})"
+            else
+              echo "waiting for OIDC role ${ROLE_ARN##*/} (github-oidc/registry-reconcile)... (${i})"
+            fi
+            sleep 15
+          done
+          echo "::error::delivery infra (OIDC role + ECR ${REPO}) not ready after ~12 min — check registry-reconcile + the Environment"
+          exit 1
+
       - name: Configure AWS credentials (caller team's ECR role)
         uses: aws-actions/configure-aws-credentials@v4
         with:
