@@ -17,7 +17,7 @@ on:
   workflow_call:
     inputs:
       app:
-        description: "App name; the image is pushed to team-<team>/<app> (team derived from the app-<team> repo name)."
+        description: "App name; the image is pushed to team-<team>/<app> (team derived from the <team>-<product> repo name)."
         required: true
         type: string
       product:
@@ -85,8 +85,8 @@ jobs:
       - uses: actions/checkout@v6
 
       # Validate inputs (these flow into run: steps below — an unsanitized value would be shell injection in
-      # a workflow app teams cannot otherwise influence) and derive the caller's team from its app-<team> repo
-      # name (NOT a caller input — cannot be spoofed). Resolve the per-PRODUCT ECR push role + image repo (ADR-069
+      # a workflow app teams cannot otherwise influence) and derive the caller's team from its <team>-<product>
+      # repo name (NOT a caller input — cannot be spoofed). Resolve the per-PRODUCT ECR push role + image repo (ADR-069
       # §5): we assume github-actions-ecr-push-product-<team>-<product>, which trusts ONLY the Product's repo and is
       # scoped to team-<team>/<product>-* in ECR. `team` is derived (unspoofable); `product` is a caller input but
       # is not a trust boundary — AWS honours only the OIDC sub/aud in the role's trust conditions, so a wrong
@@ -107,16 +107,16 @@ jobs:
           case "$PRODUCT" in
             "" | *[!a-z0-9-]*) echo "::error::invalid product name '$PRODUCT' (must match ^[a-z0-9-]+$)"; exit 1 ;;
           esac
-          # Repo must be app-<team>[-<product>] (the v3 repo-per-product convention). `team` is the FIRST
-          # segment after the app- prefix (app-alpha -> alpha; app-alpha-shop -> alpha) — unspoofable because
-          # repo creation is platform-controlled (the New Product template), and the app- prefix is required.
-          repo_name="${CALLER##*/}"   # asanexample/app-alpha-shop -> app-alpha-shop
+          # Repo must be <team>-<product> (the ADR-072 Flavor A repo-per-product convention; bare <team> also
+          # accepted). `team` is the FIRST segment of the repo name (alpha-shop -> alpha; alpha -> alpha) —
+          # unspoofable because repo creation is platform-controlled (the New Product template). The Product
+          # registry remains the real allowlist and the per-Product IAM OIDC role is the backstop. (The legacy
+          # app-<team>-<product> shape is no longer accepted — there are no app-* repos.)
+          repo_name="${CALLER##*/}"   # asanexample/alpha-shop -> alpha-shop
           case "$repo_name" in
-            app-*) : ;;
-            *) echo "::error::caller '$CALLER' is not an app-<team>[-<product>] repo; refusing to build"; exit 1 ;;
+            "" | -* | *[!a-z0-9-]*) echo "::error::caller '$CALLER' is not a <team>-<product> repo; refusing to build"; exit 1 ;;
           esac
-          rest="${repo_name#app-}"    # app-alpha-shop -> alpha-shop
-          team="${rest%%-*}"          # alpha-shop -> alpha (first segment)
+          team="${repo_name%%-*}"     # alpha-shop -> alpha (first segment)
           echo "role_arn=arn:aws:iam::${AWS_ACCOUNT}:role/github-actions-ecr-push-product-${team}-${PRODUCT}" >> "$GITHUB_OUTPUT"
           echo "image=${REGISTRY}/team-${team}/${APP}" >> "$GITHUB_OUTPUT"
 
