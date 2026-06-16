@@ -6,3 +6,7 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
+    # Batch all action updates into ONE PR/week instead of one-per-action (less noise; a single CI run).
+    groups:
+      github-actions:
+        patterns: ["*"]
