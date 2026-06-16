@@ -82,7 +82,7 @@ jobs:
       image: ${{ steps.meta.outputs.image }}
       digest: ${{ steps.build.outputs.digest }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       # Validate inputs (these flow into run: steps below — an unsanitized value would be shell injection in
       # a workflow app teams cannot otherwise influence) and derive the caller's team from its app-<team> repo
@@ -120,12 +120,32 @@ jobs:
           echo "role_arn=arn:aws:iam::${AWS_ACCOUNT}:role/github-actions-ecr-push-product-${team}-${PRODUCT}" >> "$GITHUB_OUTPUT"
           echo "image=${REGISTRY}/team-${team}/${APP}" >> "$GITHUB_OUTPUT"
 
+      # Dependabot and fork PRs run WITHOUT repo OIDC / secrets, so they cannot assume the ECR push role or
+      # cosign-sign. For those, run a BUILD-ONLY validation (build the image, no push, no sign) so the check is a
+      # real signal (does the Dockerfile still build?) instead of a permanent red. Real pushes — branch builds and
+      # same-repo deploys — still push + sign exactly as before. The gate is derived from the trigger (the actor /
+      # the head repo's fork flag), neither of which an app team can set to escalate.
+      - name: Gate push + sign (privileged context only)
+        id: gate
+        env:
+          ACTOR: ${{ github.actor }}
+          FORK: ${{ github.event.pull_request.head.repo.fork }}
+        run: |
+          set -euo pipefail
+          if [ "$ACTOR" = "dependabot[bot]" ] || [ "$FORK" = "true" ]; then
+            echo "push=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::dependabot/fork PR — build-only validation (no OIDC push, no cosign sign)."
+          else
+            echo "push=true" >> "$GITHUB_OUTPUT"
+          fi
+
       # ADR-071: a NEW Product's first deploy fires the moment the repo is scaffolded — but its OIDC push-role
       # (github-oidc / registry-reconcile) and its ECR repo (the Crossplane Composition) provision asynchronously
       # AFTER the onboarding PR merges. Wait for BOTH before building, so the first deploy is hands-off (no manual
       # re-run). Bounded; invisible in steady state (both already exist → first poll succeeds). Needs id-token
       # (already granted) for the OIDC assume-role probe; uses temp creds only to check ECR (no push here).
       - name: Wait for delivery infra (OIDC role + ECR repo)
+        if: steps.gate.outputs.push == 'true'
         env:
           ROLE_ARN: ${{ steps.meta.outputs.role_arn }}
           IMAGE: ${{ steps.meta.outputs.image }}
@@ -155,35 +175,40 @@ jobs:
           exit 1
 
       - name: Configure AWS credentials (caller team's ECR role)
-        uses: aws-actions/configure-aws-credentials@v4
+        if: steps.gate.outputs.push == 'true'
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ steps.meta.outputs.role_arn }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Log in to Amazon ECR
+        if: steps.gate.outputs.push == 'true'
         uses: aws-actions/amazon-ecr-login@v2
 
       # Enables building non-native architectures (e.g. arm64 on an amd64 runner). Apps that cross-compile in
       # their Dockerfile won't hit emulation; this is the fallback for those that build natively per-arch.
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
+      # On a privileged run, build all target arches and push. On a build-only run (dependabot/fork), build a
+      # single arch and do NOT push — a fast smoke test that the Dockerfile still builds with the bumped deps.
       - name: Build and push image
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: ${{ inputs.context }}
           file: ${{ inputs.context }}/${{ inputs.dockerfile }}
-          push: true
+          push: ${{ steps.gate.outputs.push }}
           tags: ${{ steps.meta.outputs.image }}:${{ inputs.tag }}
           build-args: ${{ inputs.build-args }}
           target: ${{ inputs.target }}
-          platforms: ${{ inputs.platforms }}
+          platforms: ${{ steps.gate.outputs.push == 'true' && inputs.platforms || 'linux/amd64' }}
 
       - name: Install cosign
+        if: steps.gate.outputs.push == 'true'
         uses: sigstore/cosign-installer@v3
         with:
           # Pin cosign v2: legacy `.att` DSSE attestation, which Kyverno's default attestor verifies
@@ -192,11 +217,13 @@ jobs:
 
       # Keyless signing via THIS workflow's GitHub OIDC identity. Sign by DIGEST.
       - name: Sign image (cosign keyless)
+        if: steps.gate.outputs.push == 'true'
         env:
           REF: ${{ steps.meta.outputs.image }}@${{ steps.build.outputs.digest }}
         run: cosign sign --yes "$REF"
 
       - name: Install Syft (download release binary + verify SHA-256)
+        if: steps.gate.outputs.push == 'true'
         env:
           SYFT_VERSION: "1.44.0" # latest stable; verify before bumping
         run: |
@@ -214,6 +241,7 @@ jobs:
       # CycloneDX SBOM, attached as a keyless-signed attestation under the same OIDC identity as the
       # signature. Kyverno's verify-attestations(SBOM) requires it at admission.
       - name: Generate + attest SBOM (CycloneDX, cosign keyless)
+        if: steps.gate.outputs.push == 'true'
         env:
           REF: ${{ steps.meta.outputs.image }}@${{ steps.build.outputs.digest }}
         run: |
