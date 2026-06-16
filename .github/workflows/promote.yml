@@ -7,6 +7,10 @@ name: Promote (shared)
 # App; the gitops Gate validates + auto-merges it, and the per-Product ApplicationSet injects the digest. The app
 # repo's main is therefore NEVER written by CI and stays fully protected.
 #
+# Two callers (#377): the build path passes an explicit `digest` (deploy.yml → dev on every push); the on-demand
+# promote-up path passes `from_stage` instead (the app's workflow_dispatch `promote.yml`) and THIS workflow copies
+# the digest already deployed in that lower stage — so the SAME signed artifact moves up the stage ladder.
+#
 # Trust model (mirrors build-sign.yml): `team` is derived from the caller's app-<team>[-<product>] repo name
 # (unspoofable); we assume the per-Product OIDC role github-actions-ecr-push-product-<team>-<product> (the same
 # role build-sign uses), read the promote App key from Secrets Manager (platform/promote/github-app), and mint a
@@ -29,9 +33,15 @@ on:
         required: true
         type: string
       digest:
-        description: "The cosign-signed image MANIFEST digest to deploy (sha256:<64 hex>) — from build-sign's output."
-        required: true
+        description: "The cosign-signed image MANIFEST digest to deploy (sha256:<64 hex>) — from build-sign's output. Mutually exclusive with from_stage; exactly one is required."
+        required: false
         type: string
+        default: ""
+      from_stage:
+        description: "On-demand promote-up (#377): instead of an explicit digest, copy the one ALREADY deployed in this LOWER stage's Release up into `stage` — the same signed artifact moves up. Reads gitops/releases/<team>/<product>/<from_stage>[-<customer>].yaml. Mutually exclusive with digest."
+        required: false
+        type: string
+        default: ""
       customer:
         description: "Optional Customer (per-customer Environments). Empty for pooled."
         required: false
@@ -67,6 +77,7 @@ jobs:
           SERVICE: ${{ inputs.service }}
           STAGE: ${{ inputs.stage }}
           DIGEST: ${{ inputs.digest }}
+          FROM_STAGE: ${{ inputs.from_stage }}
           CUSTOMER: ${{ inputs.customer }}
           CALLER: ${{ github.repository }}
         run: |
@@ -76,10 +87,25 @@ jobs:
             case "$val" in "" | *[!a-z0-9-]*) echo "::error::invalid ${v} '$val' (must match ^[a-z0-9-]+$)"; exit 1 ;; esac
           done
           case "$CUSTOMER" in *[!a-z0-9-]*) echo "::error::invalid customer '$CUSTOMER'"; exit 1 ;; esac
-          case "$DIGEST" in
-            sha256:[0-9a-f]*) [ "${#DIGEST}" -eq 71 ] || { echo "::error::digest must be sha256:<64 hex>"; exit 1; } ;;
-            *) echo "::error::digest '$DIGEST' must be a sha256:<64 hex> manifest digest"; exit 1 ;;
-          esac
+
+          # Exactly one digest source: an explicit `digest` (build-time promote, e.g. dev on push) OR `from_stage`
+          # (#377 promote-up — copy the digest already deployed in a lower stage so the SAME artifact moves up).
+          # from_stage's digest is read from its Release AFTER the platform clone (below).
+          if [ -n "$DIGEST" ] && [ -n "$FROM_STAGE" ]; then echo "::error::pass either digest OR from_stage, not both"; exit 1; fi
+          if [ -z "$DIGEST" ] && [ -z "$FROM_STAGE" ]; then echo "::error::one of digest or from_stage is required"; exit 1; fi
+          if [ -n "$DIGEST" ]; then
+            case "$DIGEST" in
+              sha256:[0-9a-f]*) [ "${#DIGEST}" -eq 71 ] || { echo "::error::digest must be sha256:<64 hex>"; exit 1; } ;;
+              *) echo "::error::digest '$DIGEST' must be a sha256:<64 hex> manifest digest"; exit 1 ;;
+            esac
+          fi
+          from_stem=""
+          if [ -n "$FROM_STAGE" ]; then
+            case "$FROM_STAGE" in *[!a-z0-9-]*) echo "::error::invalid from_stage '$FROM_STAGE'"; exit 1 ;; esac
+            [ "$FROM_STAGE" = "$STAGE" ] && { echo "::error::from_stage equals stage ('$STAGE') — nothing to promote"; exit 1; }
+            if [ -n "$CUSTOMER" ]; then from_stem="${CUSTOMER}-${FROM_STAGE}"; else from_stem="${FROM_STAGE}"; fi
+          fi
+
           repo_name="${CALLER##*/}"                    # asanexample/app-alpha-shop -> app-alpha-shop
           case "$repo_name" in app-*) : ;; *) echo "::error::caller '$CALLER' is not an app-<team>[-<product>] repo"; exit 1 ;; esac
           team="${repo_name#app-}"; team="${team%%-*}"  # app-alpha-shop -> alpha
@@ -93,8 +119,8 @@ jobs:
             echo "role_arn=arn:aws:iam::${AWS_ACCOUNT}:role/github-actions-ecr-push-product-${team}-${PRODUCT}"
             echo "env_name=${env_name}"
             echo "rel_path=gitops/releases/${team}/${PRODUCT}/${stem}.yaml"
-            echo "branch=promote/${env_name}-${SERVICE}-${DIGEST#sha256:}"
-            echo "short=${DIGEST#sha256:}"
+            echo "digest=${DIGEST}"                     # empty when promoting up (resolved post-clone from from_stage)
+            [ -n "$from_stem" ] && echo "from_rel_path=gitops/releases/${team}/${PRODUCT}/${from_stem}.yaml" || echo "from_rel_path="
           } >> "$GITHUB_OUTPUT"
 
       - name: Configure AWS credentials (per-Product role)
@@ -134,11 +160,11 @@ jobs:
           GH_TOKEN: ${{ steps.token.outputs.token }}
           PLATFORM_REPO: ${{ inputs.platform-repo }}
           REL_PATH: ${{ steps.meta.outputs.rel_path }}
+          FROM_REL_PATH: ${{ steps.meta.outputs.from_rel_path }}
           ENV_NAME: ${{ steps.meta.outputs.env_name }}
-          BRANCH: ${{ steps.meta.outputs.branch }}
           SERVICE: ${{ inputs.service }}
-          DIGEST: ${{ inputs.digest }}
-          SHORT: ${{ steps.meta.outputs.short }}
+          DIGEST: ${{ steps.meta.outputs.digest }}
+          FROM_STAGE: ${{ inputs.from_stage }}
         run: |
           set -euo pipefail
           sudo curl -fsSL -o /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
@@ -148,6 +174,20 @@ jobs:
           cd platform
           git config user.name  "asanexample-promote[bot]"
           git config user.email "asanexample-promote[bot]@users.noreply.github.com"
+
+          # Promote-up (#377): no explicit digest — copy the one ALREADY deployed in the lower stage's Release, so
+          # the SAME signed artifact moves up. (The gitops Gate re-validates the digest shape + Environment join.)
+          if [ -z "$DIGEST" ]; then
+            [ -f "$FROM_REL_PATH" ] || { echo "::error::source release ${FROM_REL_PATH} not found — is '${SERVICE}' deployed in '${FROM_STAGE}'?"; exit 1; }
+            DIGEST="$(SERVICE="$SERVICE" yq -r '.spec.services[strenv(SERVICE)].digest // ""' "$FROM_REL_PATH")"
+            case "$DIGEST" in
+              sha256:[0-9a-f]*) [ "${#DIGEST}" -eq 71 ] || { echo "::error::source digest in ${FROM_REL_PATH} is malformed"; exit 1; } ;;
+              *) echo "::error::service '${SERVICE}' has no digest in ${FROM_REL_PATH} ('${FROM_STAGE}' not deployed?)"; exit 1 ;;
+            esac
+            echo "Promoting '${SERVICE}' up from '${FROM_STAGE}': ${DIGEST}"
+          fi
+          SHORT="${DIGEST#sha256:}"
+          BRANCH="promote/${ENV_NAME}-${SERVICE}-${SHORT}"
 
           # Create-or-update via yq (starting from {} if absent), so a multi-service Product accumulates one
           # digest per Service in a single Release and re-promotes are idempotent — no heredoc indentation traps.
@@ -171,6 +211,8 @@ jobs:
           git checkout -b "$BRANCH"
           git commit -m "promote: ${ENV_NAME} ${SERVICE} -> sha256:${SHORT}"
           git push -u origin "$BRANCH"
+          src_note=""
+          [ -n "$FROM_STAGE" ] && src_note=" (promoted up from \`${FROM_STAGE}\`)"
           gh pr create --repo "$PLATFORM_REPO" --base main --head "$BRANCH" \
             --title "promote: ${ENV_NAME} ${SERVICE} -> ${SHORT:0:12}" \
-            --body "Control-plane digest bump (ADR-071): \`${SERVICE}\` in \`${ENV_NAME}\` -> \`${DIGEST}\`. The gitops Gate validates + auto-merges; the ApplicationSet injects it. The app repo's main is untouched."
+            --body "Control-plane digest bump (ADR-071): \`${SERVICE}\` in \`${ENV_NAME}\` -> \`${DIGEST}\`${src_note}. The gitops Gate validates + auto-merges; the ApplicationSet injects it. The app repo's main is untouched."
