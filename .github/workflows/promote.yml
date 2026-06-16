@@ -11,7 +11,7 @@ name: Promote (shared)
 # promote-up path passes `from_stage` instead (the app's workflow_dispatch `promote.yml`) and THIS workflow copies
 # the digest already deployed in that lower stage — so the SAME signed artifact moves up the stage ladder.
 #
-# Trust model (mirrors build-sign.yml): `team` is derived from the caller's app-<team>[-<product>] repo name
+# Trust model (mirrors build-sign.yml): `team` is derived from the caller's <team>-<product> repo name
 # (unspoofable); we assume the per-Product OIDC role github-actions-ecr-push-product-<team>-<product> (the same
 # role build-sign uses), read the promote App key from Secrets Manager (platform/promote/github-app), and mint a
 # short-lived installation token. This workflow lives in a repo app teams cannot write to, so a compromised app
@@ -66,7 +66,7 @@ jobs:
       contents: read
     steps:
       # Validate inputs (they flow into run: steps — sanitize in a workflow app teams cannot influence) and
-      # derive team from the caller's app-<team>[-<product>] repo name (NOT an input — unspoofable). Compute the
+      # derive team from the caller's <team>-<product> repo name (NOT an input — unspoofable). Compute the
       # Environment name + the gitops/releases path the same way the scaffolder/Composition do:
       #   pooled:        name <team>-<product>-<stage>            file <stage>.yaml
       #   per-customer:  name <team>-<product>-<customer>-<stage> file <customer>-<stage>.yaml
@@ -106,9 +106,9 @@ jobs:
             if [ -n "$CUSTOMER" ]; then from_stem="${CUSTOMER}-${FROM_STAGE}"; else from_stem="${FROM_STAGE}"; fi
           fi
 
-          repo_name="${CALLER##*/}"                    # asanexample/app-alpha-shop -> app-alpha-shop
-          case "$repo_name" in app-*) : ;; *) echo "::error::caller '$CALLER' is not an app-<team>[-<product>] repo"; exit 1 ;; esac
-          team="${repo_name#app-}"; team="${team%%-*}"  # app-alpha-shop -> alpha
+          repo_name="${CALLER##*/}"                    # asanexample/alpha-shop -> alpha-shop
+          case "$repo_name" in "" | -* | *[!a-z0-9-]*) echo "::error::caller '$CALLER' is not a <team>-<product> repo"; exit 1 ;; esac
+          team="${repo_name%%-*}"                       # alpha-shop -> alpha
           if [ -n "$CUSTOMER" ]; then
             env_name="${team}-${PRODUCT}-${CUSTOMER}-${STAGE}"; stem="${CUSTOMER}-${STAGE}"
           else
